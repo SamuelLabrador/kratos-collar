@@ -1,24 +1,22 @@
 #include "LSM6DSOX_CUSTOM.h"
-#include <Adafruit_DPS310.h>
+#include <Adafruit_BMP3XX.h>
 #include <ArduinoBLE.h>
-#include <Scheduler.h>
 
-#define DPS310_CS 10
-
-typedef struct packet {
+typedef struct Packet {
   uint16_t value[6];
   float barometerData[2];
-}packet;
+}Packet;
 BLEService BarbellService("19B10000-E8F2-537E-4F6C-D104768A1214"); // BLE LED Service
-BLETypedCharacteristic<packet> DataCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1215", BLERead | BLENotify | BLEWrite);
+BLETypedCharacteristic<Packet> DataCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1215", BLERead | BLENotify | BLEWrite);
 BLETypedCharacteristic<byte> CommandCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1216", BLEWrite);
+//BLETypedCharacteristic<byte> EventCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1217", BLERead | BLENotify);
 
 enum COMMAND {
   WAIT = 0x00,
   TRANSMIT_DATA = 0x01
 };
 
-Adafruit_DPS310 dps;
+Adafruit_BMP3XX bmp;
 bool transmitData;
 
 void configureBLE() {
@@ -32,6 +30,7 @@ void configureBLE() {
   BLE.setAdvertisedService(BarbellService);
   BarbellService.addCharacteristic(DataCharacteristic);
   BarbellService.addCharacteristic(CommandCharacteristic);
+//  BarbellService.addCharacteristic(EventCharacteristic);
 
   // add service
   BLE.addService(BarbellService);
@@ -42,13 +41,15 @@ void configureBLE() {
 }
 
 void configureBarometer() {
-  if (! dps.begin_SPI(10)) {
+  if (! bmp.begin_SPI(10)) {
     Serial.println("Failed to find DPS");
     while (1) yield();
   }
 
-  dps.configurePressure(DPS310_64HZ, DPS310_64SAMPLES);
-  dps.configureTemperature(DPS310_64HZ, DPS310_64SAMPLES);
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_16X);
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  bmp.setOutputDataRate(BMP3_ODR_100_HZ);
 }
 
 void configureAccel() {
@@ -70,46 +71,71 @@ void setup() {
   configureBarometer();
 }
 
-void loop() {
-  sensors_event_t temp_event, pressure_event;
 
+void loop() {
   BLEDevice central = BLE.central();
-  boolean flag = false;
 
   if (central) {
     Serial.print("Connected to central: ");
     Serial.println(central.address());
 
-    while (central.connected()) {
-      flag = true;
+    uint16_t xl_x, xl_y, xl_z;
+    uint16_t gyro_x, gyro_y, gyro_z;
+    uint8_t previousCommand = 0x00;
+    uint8_t command;
+    if (central.connected()) {
       digitalWrite(LED_BUILTIN, HIGH);
+    }
 
-      uint16_t xl_x, xl_y, xl_z;
-      uint16_t gyro_x, gyro_y, gyro_z;
-
-      uint8_t command;
+    while (central.connected()) {
       CommandCharacteristic.readValue(command);
 
-      dps.getEvents(&temp_event, &pressure_event);
+      switch (command) {
+        case WAIT:
+          // We are moving from TRANSMIT_DATA -> WAIT
+          // Set EventCharacteristic -> 0x01
+          if (previousCommand == TRANSMIT_DATA) {
+//            EventCharacteristic.setValue(0x01);
+          }
+          break;
+        case TRANSMIT_DATA:
+          if (previousCommand == WAIT) {
+//            EventCharacteristic.setValue(0x00);
+          }
 
-      if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
-        IMU.readAcceleration(xl_x, xl_y, xl_z);
-        IMU.readGyroscope(gyro_x, gyro_y, gyro_z);
-        uint64_t zero = 0;
+          if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()){ // && bmp.performReading()) {
+            float pressure = 0.0; //bmp.readPressure() / 100.0;
+            float temperature = 0.0; //bmp.readTemperature();
+            IMU.readAcceleration(xl_x, xl_y, xl_z);
+            IMU.readGyroscope(gyro_x, gyro_y, gyro_z);
+            uint64_t zero = 0;
 
-        packet packet = {xl_x, xl_y, xl_z,
-                         gyro_x, gyro_y, gyro_z,
-                         pressure_event.pressure, temp_event.temperature};
+            Packet packet = {xl_x, xl_y, xl_z,
+                             gyro_x, gyro_y, gyro_z,
+                             pressure, temperature};
 
+            DataCharacteristic.writeValue(packet);
+          }
+          break;
+      }
+
+      previousCommand = command;
+    }
+
+
+    digitalWrite(LED_BUILTIN, LOW);
+
+    delay(500);
+  }
+}
         // Uncomment for debug
-        Serial.print(F("Pressure = "));
-        Serial.print(pressure_event.pressure);
-        Serial.print(" hPa ");
-
-        Serial.print(F("Temperature = "));
-        Serial.print(temp_event.temperature);
-        Serial.print(" *C ");
-
+//        Serial.print(F("Pressure = "));
+//        Serial.print(pressure);
+//        Serial.print(" hPa ");
+//
+//        Serial.print(F("Temperature = "));
+//        Serial.print(temperature);
+//        Serial.print(" *C ");
 //
 //        Serial.print("XL = ");
 //        Serial.print(xl_x);
@@ -126,37 +152,4 @@ void loop() {
 //        Serial.print(", ");
 //        Serial.print(gyro_z);
 //        Serial.println(", ");
-        Serial.println("");
-
-        DataCharacteristic.writeValue(packet);
-      }
-//      switch (command) {
-//        case WAIT:
-//          delay(10);
-//          break;
-//        case TRANSMIT_DATA:
-//          if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
-//            IMU.readAcceleration(xl_x, xl_y, xl_z);
-//            IMU.readGyroscope(gyro_x, gyro_y, gyro_z);
-//            uint64_t zero = 0;
-//
-//            packet packet = {xl_x, xl_y, xl_z,
-//                             gyro_x, gyro_y, gyro_z,
-//                             temp_event.temperature, pressure_event.pressure};
-//
-//            DataCharacteristic.writeValue(packet);
-//          }
-//          break;
-//      }
-
-      yield();
-    }
-
-    if (flag) {
-      Serial.println("Disconnected!");
-      digitalWrite(LED_BUILTIN, LOW);
-    }
-
-    delay(500);
-  }
-}
+//        Serial.println("");

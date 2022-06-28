@@ -84,7 +84,7 @@ int LSM6DSOXClass::begin()
     return 0;
   }
 
-  //set the gyroscope control register to work at 52 Hz, 2000 dps and in bypass mode
+  //set the gyroscope control register to work at 52 Hz, 2000 bmp and in bypass mode
   writeRegister(LSM6DSOX_CTRL2_G, 0x3C);
 
   // Set the Accelerometer control register to work at 104 Hz, 4 g,and in bypass mode and enable ODR/4
