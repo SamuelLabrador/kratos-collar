@@ -1,11 +1,12 @@
 #include "LSM6DSOX_CUSTOM.h"
-#include <Adafruit_BMP3XX.h>
 #include <ArduinoBLE.h>
 //#include <Adafruit_DPS310.h>
 #include <Wire.h>
 #include "icp101xx.h"
 #include <Scheduler.h>
+#include <Adafruit_LC709203F.h>
 
+Adafruit_LC709203F lc;
 typedef struct Packet {
   uint16_t value[6];
   float barometerData[2];
@@ -14,6 +15,8 @@ BLEService BarbellService("19B10000-E8F2-537E-4F6C-D104768A1214"); // BLE LED Se
 BLETypedCharacteristic<Packet> DataCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1215", BLERead | BLENotify | BLEWrite);
 BLETypedCharacteristic<byte> CommandCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1216", BLEWrite);
 BLETypedCharacteristic<byte> EventCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1217", BLERead | BLENotify);
+BLETypedCharacteristic<int> VoltageCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1218", BLERead | BLENotify);
+
 
 double GRAVITY = 9.80665;
 
@@ -37,6 +40,7 @@ void configureBLE() {
   BarbellService.addCharacteristic(DataCharacteristic);
   BarbellService.addCharacteristic(CommandCharacteristic);
   BarbellService.addCharacteristic(EventCharacteristic);
+  BarbellService.addCharacteristic(VoltageCharacteristic);
 
   // add service
   BLE.addService(BarbellService);
@@ -54,6 +58,21 @@ void configureBarometer() {
   Serial.println("Barometer initialized!");
 }
 
+void configureBatteryMeter() {
+  Serial.println("Configuring battery meter");
+
+  if (!lc.begin()) {
+    Serial.println("Couldnt find Adafruit LC709203F?\nMake sure a battery is plugged in!");
+    while (1) yield();
+  }
+
+  lc.setThermistorB(3950);
+  lc.setPackSize(LC709203F_APA_1000MAH);
+  lc.setAlarmVoltage(3.8);
+
+  Serial.println("Battery meter initialized!");
+}
+
 void configureAccel() {
   if (!IMU.begin()) {
     Serial.println("Failed to initialize IMU!");
@@ -62,7 +81,7 @@ void configureAccel() {
   Serial.println("IMU initialized");
 }
 
-void loop() {
+void centralLoop() {
   BLEDevice central = BLE.central();
 
   float result;
@@ -111,9 +130,9 @@ void loop() {
             double xl_z = (raw_xl_z * (4.0 / 32768.0)) * GRAVITY;
 
             double magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
-            if (previousAcceleration != -1.0) {
-              difference = 
-            }
+//            if (previousAcceleration != -1.0) {
+//              difference =
+//            }
             uint64_t zero = 0;
 
             Packet packet = {raw_xl_x, raw_xl_y, raw_xl_z,
@@ -157,18 +176,32 @@ void ledLoop() {
   delay(amt);
 }
 
+void batteryLoop() {
+  if (BLE.connected()) {
+    int value = analogRead(A2);
+    VoltageCharacteristic.setValue(value);
+  }
+
+  delay(5000);  // dont query too often!
+}
+
 void activityDetectionLoop() {
 
 }
 
 void setup() {
   Serial.begin(9600);
-
+//  while (!Serial) {}
   pinMode(LED_BUILTIN, OUTPUT);
 
   configureBLE();
   configureAccel();
   configureBarometer();
-
   Scheduler.startLoop(ledLoop);
+  Scheduler.startLoop(centralLoop);
+  Scheduler.startLoop(batteryLoop);
+}
+
+void loop() {
+  yield();
 }

@@ -12,6 +12,7 @@ include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_DPS310
 #include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_BMP3XX_Library")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_BusIO")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_Unified_Sensor")
+include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_LC709203F")
 include_directories("C:/Program Files (x86)/Arduino/hardware/arduino/avr/libraries/Wire/src")
 include_directories("C:/Program Files (x86)/Arduino/hardware/arduino/avr/libraries/SPI/src")
 include_directories("C:/arduino")
