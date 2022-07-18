@@ -5,6 +5,7 @@
 #include "icp101xx.h"
 #include <Scheduler.h>
 #include <Adafruit_LC709203F.h>
+#include <queue>
 
 Adafruit_LC709203F lc;
 typedef struct Packet {
@@ -13,20 +14,39 @@ typedef struct Packet {
 }Packet;
 BLEService BarbellService("19B10000-E8F2-537E-4F6C-D104768A1214"); // BLE LED Service
 BLETypedCharacteristic<Packet> DataCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1215", BLERead | BLENotify | BLEWrite);
-BLETypedCharacteristic<byte> CommandCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1216", BLEWrite);
+//BLETypedCharacteristic<byte> CommandCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1216", BLEWrite);
 BLETypedCharacteristic<byte> EventCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1217", BLERead | BLENotify);
 BLETypedCharacteristic<int> VoltageCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1218", BLERead | BLENotify);
 
 
 double GRAVITY = 9.80665;
+const int MA_AMOUNT = 5;
 
 enum COMMAND {
-  WAIT = 0x00,
-  TRANSMIT_DATA = 0x01
+  SLEEP = 0x00,
+  READY = 0x01
 };
 
+enum XL_TRANSMIT_STATE {
+  WAIT_TRANSMIT,
+  TRANSMIT
+};
+
+XL_TRANSMIT_STATE transmitState = WAIT_TRANSMIT;
 ICP101xx icp;
 uint8_t command;
+
+double shiftAndPop(double *window, uint8_t window_size, double element) {
+  double average = 0;
+  for (uint8_t i = 0; i < window_size - 1; i++) {
+    window[i] = window[i + 1];
+    average += window[i];
+  }
+
+  window[window_size - 1] = element;
+  average += element;
+  return average / (double)window_size;
+}
 
 void configureBLE() {
   // begin initialization
@@ -38,8 +58,9 @@ void configureBLE() {
   BLE.setLocalName("Kratos Collar");
   BLE.setAdvertisedService(BarbellService);
   BarbellService.addCharacteristic(DataCharacteristic);
-  BarbellService.addCharacteristic(CommandCharacteristic);
+//  BarbellService.addCharacteristic(CommandCharacteristic);
   BarbellService.addCharacteristic(EventCharacteristic);
+  EventCharacteristic.setValue(0x00);
   BarbellService.addCharacteristic(VoltageCharacteristic);
 
   // add service
@@ -81,7 +102,7 @@ void configureAccel() {
   Serial.println("IMU initialized");
 }
 
-void centralLoop() {
+void mainLoop() {
   BLEDevice central = BLE.central();
 
   float result;
@@ -98,52 +119,80 @@ void centralLoop() {
     uint8_t previousCommand = 0x00;
     bool icpMeasuring = false;
 
+    uint8_t loadCount = 0;
+    double movingAverageXL[MA_AMOUNT] = {};
+    double previousAverage = -1.0;
+    const uint8_t STOP_DURATION = 100;
+    uint8_t stopCount = STOP_DURATION;
+    const uint8_t START_DURATION = 10;
+    uint8_t startCount = START_DURATION;
+    transmitState = WAIT_TRANSMIT; // Should be WAIT_TRANSMIT
+
     while (central.connected()) {
-      CommandCharacteristic.readValue(command);
+      if (!icpMeasuring) {
+        icp.measureStart(ICP101xx::ACCURATE);
+        icpMeasuring = true;
+      }
 
-      switch (command) {
-        case WAIT:
-          // We are moving from TRANSMIT_DATA -> WAIT
-          // Set EventCharacteristic -> 0x01
-          if (previousCommand == TRANSMIT_DATA) {
-            EventCharacteristic.setValue(0x01);
+      if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable() && icp.dataReady()) {
+        float pressure = icp.getPressurePa() / 100.0;
+        float temperature = icp.getTemperatureC();
+        IMU.readAcceleration(raw_xl_x, raw_xl_y, raw_xl_z);
+        IMU.readGyroscope(gyro_x, gyro_y, gyro_z);
+
+        double xl_x = (raw_xl_x * (4.0 / 32768.0)) * GRAVITY;
+        double xl_y = (raw_xl_y * (4.0 / 32768.0)) * GRAVITY;
+        double xl_z = (raw_xl_z * (4.0 / 32768.0)) * GRAVITY;
+
+        double magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
+
+        double average = shiftAndPop(movingAverageXL, MA_AMOUNT, magnitude);
+
+        if (loadCount < MA_AMOUNT) {
+          movingAverageXL[loadCount] = average;
+          loadCount += 1;
+        } else {
+          switch (transmitState) {
+            case WAIT_TRANSMIT:
+              if (previousAverage >= 0 && abs(average - previousAverage) > 0.1) {
+                startCount -= 1;
+              } else {
+                startCount = START_DURATION;
+              }
+
+              if (startCount <= 0) {
+                transmitState = TRANSMIT;
+                EventCharacteristic.setValue(0x01);
+              }
+              break;
+            case TRANSMIT:
+              if (abs(average - previousAverage) < 0.01) {
+                stopCount -= 1;
+              } else {
+                stopCount = STOP_DURATION;
+              }
+
+              if (stopCount <= 0) {
+                transmitState = WAIT_TRANSMIT;
+                EventCharacteristic.setValue(0x00);
+              }
+              break;
           }
-          break;
-        case TRANSMIT_DATA:
-          if (previousCommand == WAIT) {
-            EventCharacteristic.setValue(0x00);
-          }
+        }
 
-          if (!icpMeasuring) {
-            icp.measureStart(ICP101xx::ACCURATE);
-            icpMeasuring = true;
-          }
+        previousAverage = average;
 
-          if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable() && icp.dataReady()) {
-            float pressure = icp.getPressurePa() / 100.0;
-            float temperature = icp.getTemperatureC();
-            IMU.readAcceleration(raw_xl_x, raw_xl_y, raw_xl_z);
-            IMU.readGyroscope(gyro_x, gyro_y, gyro_z);
+        if (transmitState == TRANSMIT) {
+          uint64_t zero = 0;
 
-            double xl_x = (raw_xl_x * (4.0 / 32768.0)) * GRAVITY;
-            double xl_y = (raw_xl_y * (4.0 / 32768.0)) * GRAVITY;
-            double xl_z = (raw_xl_z * (4.0 / 32768.0)) * GRAVITY;
+          Packet packet = {raw_xl_x, raw_xl_y, raw_xl_z,
+                           gyro_x, gyro_y, gyro_z,
+                           pressure, temperature};
 
-            double magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
-//            if (previousAcceleration != -1.0) {
-//              difference =
-//            }
-            uint64_t zero = 0;
+          DataCharacteristic.writeValue(packet);
+        }
 
-            Packet packet = {raw_xl_x, raw_xl_y, raw_xl_z,
-                             gyro_x, gyro_y, gyro_z,
-                             pressure, temperature};
-
-            DataCharacteristic.writeValue(packet);
-
-            icpMeasuring = false;
-          }
-          break;
+        icpMeasuring = false;
       }
 
       previousCommand = command;
@@ -157,19 +206,18 @@ void centralLoop() {
 }
 
 void ledLoop() {
-  int amt = 250;
+  const unsigned long amt = 250;
   if (BLE.connected()) {
-    switch (command) {
-      case WAIT:
+    switch (transmitState) {
+      case WAIT_TRANSMIT:
         digitalWrite(LED_BUILTIN, HIGH);
         break;
-      case TRANSMIT_DATA:
+      case TRANSMIT:
         digitalWrite(LED_BUILTIN, LOW);
         delay(amt);
         digitalWrite(LED_BUILTIN, HIGH);
         break;
     }
-
   } else {
     digitalWrite(LED_BUILTIN, LOW);
   }
@@ -197,8 +245,9 @@ void setup() {
   configureBLE();
   configureAccel();
   configureBarometer();
+
   Scheduler.startLoop(ledLoop);
-  Scheduler.startLoop(centralLoop);
+  Scheduler.startLoop(mainLoop);
   Scheduler.startLoop(batteryLoop);
 }
 
