@@ -17,7 +17,6 @@ typedef struct GravityPacket {
   float data[3];
 } GravityPacket;
 
-
 typedef struct Quaternion {
   float data[4];
 } Quaternion;
@@ -60,7 +59,7 @@ double shiftAndPop(float *window, uint8_t window_size, double element) {
 void configureBLE() {
   // begin initialization
   if (!BLE.begin()) {
-    Serial.println("starting Bluetooth® Low Energy failed!");
+    // Serial.println("starting Bluetooth® Low Energy failed!");
   }
 
   // set advertised local name and service UUID:
@@ -86,46 +85,44 @@ void configureBLE() {
 
   // start advertising
   BLE.advertise();
-  Serial.println("BLE Peripheral initialized.");
+  // Serial.println("BLE Peripheral initialized.");
 }
 
 void configureBarometer() {
-  Serial.println("Configuring barometer");
+  // Serial.println("Configuring barometer");
   if (! icp.begin()) {
     while (1) yield();
   }
-  Serial.println("Barometer initialized!");
+  // Serial.println("Barometer initialized!");
 }
 
 void configureBatteryMeter() {
-  Serial.println("Configuring battery meter");
+  // Serial.println("Configuring battery meter");
 
-  Serial.println("Battery meter initialized!");
+  // Serial.println("Battery meter initialized!");
 }
 
 void configureAccel() {
   if (!bno.begin()) {
     /* There was a problem detecting the BNO055 ... check your connections */
-    Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
+    // Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
     while(1);
   }
-  Serial.println("IMU initialized");
+  // Serial.println("IMU initialized");
 }
 
 void mainLoop() {
   BLEDevice central = BLE.central();
 
   float result;
-  icp.measure(ICP101xx::ACCURATE);
 
   if (central) {
-    Serial.print("Connected to central: ");
-    Serial.println(central.address());
+    millis();
+    // Serial.print("Connected to central: ");
+    // Serial.println(central.address());
 
     sensors_event_t linearXL, gravity;
     double previousAcceleration = -1.0;
-
-    uint8_t previousCommand = 0x00;
 
     uint8_t loadCount = 0;
     float movingAverageXL[MA_AMOUNT] = {};
@@ -137,72 +134,88 @@ void mainLoop() {
     uint8_t startCount = START_DURATION;
 
     transmitState = WAIT_TRANSMIT;
+    if (central.connected()) {
+      icp.measureStart(ICP101xx::ACCURATE);
+    }
+
+    unsigned short xlCount = 0;
+    unsigned short barometerCount = 0;
 
     while (central.connected()) {
       closedState = digitalRead(3);
 
-      bno.getEvent(&linearXL, Adafruit_BNO055::VECTOR_LINEARACCEL);
-      bno.getEvent(&gravity, Adafruit_BNO055::VECTOR_GRAVITY);
-      imu::Quaternion quaternion = bno.getQuat();
+      // Read xl and gyr data every 10ms. 100Hz.
+      if (xlCount >= 10) {
+        xlCount = 0;
+        bno.getEvent(&linearXL, Adafruit_BNO055::VECTOR_LINEARACCEL);
+        bno.getEvent(&gravity, Adafruit_BNO055::VECTOR_GRAVITY);
+        imu::Quaternion quaternion = bno.getQuat();
 
-      float quat_w = quaternion.w();
-      float quat_x = quaternion.x();
-      float quat_y = quaternion.y();
-      float quat_z = quaternion.z();
+        // Units m/s^2
+        float xl_x = linearXL.acceleration.x;
+        float xl_y = linearXL.acceleration.y;
+        float xl_z = linearXL.acceleration.z;
 
-      // Units m/s^2
-      float xl_x = linearXL.acceleration.x;
-      float xl_y = linearXL.acceleration.y;
-      float xl_z = linearXL.acceleration.z;
+        float magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
 
-      float magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
+        float average = shiftAndPop(movingAverageXL, MA_AMOUNT, magnitude);
 
-      float average = shiftAndPop(movingAverageXL, MA_AMOUNT, magnitude);
+        // Serial.print("Transmit State: ");
+        // Serial.print(transmitState);
+        // Serial.print(" The difference: ");
+        // Serial.print(abs(average - previousAverage));
+        // Serial.print(" The stop count: ");
+        // Serial.println(stopCount);
 
-      Serial.print("Transmit State: ");
-      Serial.print(transmitState);
-      Serial.print(" The difference: ");
-      Serial.print(abs(average - previousAverage));
-      Serial.print(" The stop count: ");
-      Serial.println(stopCount);
+        if (loadCount < MA_AMOUNT) {
+          movingAverageXL[loadCount] = average;
+          loadCount += 1;
+        } else {
+          switch (transmitState) {
+            case WAIT_TRANSMIT:
+              if (previousAverage >= 0 && abs(average - previousAverage) > 0.05) {
+                startCount -= 1;
+              } else {
+                startCount = START_DURATION;
+              }
 
-      if (loadCount < MA_AMOUNT) {
-        movingAverageXL[loadCount] = average;
-        loadCount += 1;
-      } else {
-        switch (transmitState) {
-          case WAIT_TRANSMIT:
-            if (previousAverage >= 0 && abs(average - previousAverage) > 0.1) {
-              startCount -= 1;
-            } else {
-              startCount = START_DURATION;
-            }
+              if (startCount <= 0) {
+                transmitState = TRANSMIT;
+                EventCharacteristic.writeValue(0x01);
+              }
+              break;
+            case TRANSMIT:
+              if (abs(average - previousAverage) < 0.1) {
+                stopCount -= 1;
+              } else {
+                stopCount = STOP_DURATION;
+              }
 
-            if (startCount <= 0) {
-              transmitState = TRANSMIT;
-              EventCharacteristic.writeValue(0x01);
-            }
-            break;
-          case TRANSMIT:
-            if (abs(average - previousAverage) < 0.1) {
-              stopCount -= 1;
-            } else {
-              stopCount = STOP_DURATION;
-            }
-
-            if (stopCount <= 0 || !closedState) {
-              transmitState = WAIT_TRANSMIT;
-              stopCount = 0;
-              EventCharacteristic.writeValue(0x00);
-            }
-            break;
+              if (stopCount <= 0 || !closedState) {
+                transmitState = WAIT_TRANSMIT;
+                stopCount = 0;
+                EventCharacteristic.writeValue(0x00);
+              }
+              break;
+          }
+          previousAverage = average;
         }
-        previousAverage = average;
-      }
 
-      if (!icpMeasuring) {
-        icp.measureStart(ICP101xx::ACCURATE);
-        icpMeasuring = true;
+        if (transmitState == TRANSMIT) {
+          uint64_t zero = 0;
+
+          XLPacket packet = {xl_x, xl_y, xl_z};
+          LinearAccelerationCharacteristic.writeValue(packet);
+
+          float quat_w = quaternion.w();
+          float quat_x = quaternion.x();
+          float quat_y = quaternion.y();
+          float quat_z = quaternion.z();
+          Quaternion quatPacket = {quat_w, quat_x, quat_y, quat_z};
+          QuaternionCharacteristic.writeValue(quatPacket);
+        }
+      } else {
+        xlCount++;
       }
 
       if (icp.dataReady()) {
@@ -213,23 +226,11 @@ void mainLoop() {
           PressureTempPacket ptPacket = {pressure, temperature};
           PressureTempCharacteristic.writeValue(ptPacket);
         }
-        icpMeasuring = false;
+
+        icp.measureStart(ICP101xx::ACCURATE);
       }
 
-
-      if (transmitState == TRANSMIT) {
-        uint64_t zero = 0;
-
-        XLPacket packet = {xl_x, xl_y, xl_z};
-        LinearAccelerationCharacteristic.writeValue(packet);
-
-        Quaternion quatPacket = {quat_w, quat_x, quat_y, quat_z};
-        QuaternionCharacteristic.writeValue(quatPacket);
-      }
-
-      previousCommand = command;
-      // Wait 10 milliseconds before getting the reading again
-      delay(20);
+      delay(1);
     }
 
     digitalWrite(LED_BUILTIN, LOW);
@@ -279,9 +280,9 @@ void batteryLoop() {
 }
 
 void setup() {
-  Serial.begin(9600);
-//  while (!Serial) {}
-  Serial.println("Collar warming up...");
+//  // Serial.begin(9600);
+//  while (!// Serial) {}
+//  // Serial.println("Collar warming up...");
   pinMode(LED_BUILTIN, OUTPUT);
 
   configureBLE();
@@ -293,7 +294,7 @@ void setup() {
   Scheduler.startLoop(ledLoop);
   Scheduler.startLoop(batteryLoop);
   Scheduler.startLoop(mainLoop);
-  Serial.println("Finished collar startup!");
+  // Serial.println("Finished collar startup!");
   delay(1000);
 }
 
