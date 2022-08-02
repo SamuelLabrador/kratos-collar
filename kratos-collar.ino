@@ -4,6 +4,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include "BluetoothSerial.h"
+#include <ArduinoJson.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
@@ -22,36 +23,29 @@ BluetoothSerial SerialBT;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 ICP101xx icp;
 
-typedef struct EventPacket {
-  // [ code, eventID ]
-  unsigned char data[2];  // SHOULD ALWAYS BE 1
-} EventPacket;
-
-typedef struct XLPacket {
-  unsigned char code; // SHOULD ALWAYS BE 1
-  unsigned long timestamp;
-  float data[7]; // XL + QUATERNION
-} XLPacket;
-
-typedef struct PressureTempPacket {
-  unsigned char code; // SHOULD ALWAYS BE 2
-  float data[2]; // PRESSURE + TEMPERATURE
-} PressureTempPacket;
-
-typedef struct BluetoothPacket {
-  unsigned char code;
-  float data[3]; // UP TO 12 values depending on the code
-} BluetoothPacket;
-
 const int MA_AMOUNT = 5;
 
-#define EVENT_PACKET 0
-#define XL_PACKET 1
-#define PT_PACKET 2
+#define EVENT_PACKET 'E'
+#define XL_PACKET "X'
+#define PT_PACKET "P"
+#define EVENT_TRANSMIT_START 1.0
+#define EVENT_TRANSMIT_END 2.0
 
 enum XL_TRANSMIT_STATE {
   WAIT_TRANSMIT,
   TRANSMIT
+};
+
+struct PressurePacket {
+  float data[3];
+};
+
+struct IMUPacket {
+  float data[12];
+};
+
+struct EventPacket {
+  unsigned char event;
 };
 
 /**
@@ -59,37 +53,30 @@ enum XL_TRANSMIT_STATE {
  */
 bool closedState = false;
 XL_TRANSMIT_STATE transmitState = WAIT_TRANSMIT;
-const uint8_t STOP_DURATION = 600;
-const uint8_t START_DURATION = 15;
+const uint16_t STOP_DURATION = 600;
+const uint16_t START_DURATION = 15;
 
-// BLE Buffers
-const uint8_t xlBufferSize = 100;
-const uint8_t pressureSize = 40;
-XLPacket xlBuffer[xlBufferSize] = {};
-//QuaternionPacket quaternionBuffer[xlBufferSize] = {};
-BluetoothPacket pressureTempBuffer[pressureSize] = {};
+// Bluetooth Buffers
+const uint16_t IMU_BUFFER_SIZE = 100;
+const uint16_t PRESSURE_BUFFER_SIZE = 40;
+
+IMUPacket imuBuffer[IMU_BUFFER_SIZE];
+PressurePacket pressureTempBuffer[PRESSURE_BUFFER_SIZE];
 unsigned long pCount = 0;
 
-QueueHandle_t bluetoothQueue;
+// FreeRTOS variables
+QueueHandle_t pressureQueue;
+QueueHandle_t imuQueue;
+QueueHandle_t eventQueue;
+
+TaskHandle_t xHandle = NULL;
+TaskHandle_t ptHandle = NULL;
+TaskHandle_t clampHandle = NULL;
+TaskHandle_t bluetoothHandle = NULL;
 
 /**
  * HELPER FUNCTIONS
  */
-void shiftLeft(XLPacket *buffer, uint8_t window_size) {
-  for (uint8_t i = 0; i < window_size - 1; i++) {
-    buffer[i] = buffer[i + 1];
-  }
-}
-//void shiftLeft(QuaternionPacket *buffer, uint8_t window_size) {
-//  for (uint8_t i = 0; i < window_size - 1; i++) {
-//    buffer[i] = buffer[i + 1];
-//  }
-//}
-void shiftLeft(PressureTempPacket *buffer, uint8_t window_size) {
-  for (uint8_t i = 0; i < window_size - 1; i++) {
-    buffer[i] = buffer[i + 1];
-  }
-}
 double shiftAndPop(float *window, uint8_t window_size, double element) {
   float average = 0;
   for (uint8_t i = 0; i < window_size - 1; i++) {
@@ -100,6 +87,18 @@ double shiftAndPop(float *window, uint8_t window_size, double element) {
   window[window_size - 1] = element;
   average += element;
   return average / (double)window_size;
+}
+
+void shiftLeft(IMUPacket *buffer, uint16_t size) {
+  for (uint8_t i = 0; i < size - 1; i++) {
+    buffer[i] = buffer[i + 1];
+  }
+}
+
+void shiftLeft(PressurePacket *buffer, uint16_t size) {
+  for (uint8_t i = 0; i < size - 1; i++) {
+    buffer[i] = buffer[i + 1];
+  }
 }
 
 /**
@@ -125,7 +124,7 @@ void configureAccel() {
 }
 
 void configureBluetooth() {
-  SerialBT.begin("ESP32test"); //Bluetooth device name
+  SerialBT.begin("KratosCollar"); //Bluetooth device name
   Serial.println("The device started, now you can pair it with bluetooth!");
 }
 
@@ -133,52 +132,83 @@ void configureBluetooth() {
  * TASK FUNCTIONS
  */
 void bluetoothTransmitTask(void * params) {
-  struct BluetoothPacket bluetoothPacket;
+  delay(100);
   for (;;) {
-    if (bluetoothQueue != NULL) {
-      if (xQueueReceive(bluetoothQueue, &(bluetoothPacket), ( TickType_t ) 1 ) == pdPASS) {
-          const byte * p = (const byte*) &bluetoothPacket;
-          for (uint8_t i = 0; i < sizeof bluetoothPacket; i++) {
-            SerialBT.write(*p++);
+    PressurePacket pressurePacket;
+    IMUPacket imuPacket;
+    EventPacket eventPacket;
+    if (pressureQueue != NULL && imuQueue != NULL && eventQueue != NULL) {
+      String payload ="";
+
+      if (xQueueReceive(eventQueue, &(eventPacket), (TickType_t) 0) == pdPASS) {
+        StaticJsonDocument<256> eventDoc;
+        eventDoc["e"] = "E";
+        eventDoc["d"] = eventPacket.event;
+
+        serializeJson(eventDoc, payload);
+      }
+
+      for(uint8_t j = 0; j < 10; j++) {
+        if (xQueueReceive(pressureQueue, &(pressurePacket), ( TickType_t ) 0) == pdPASS) {
+          DynamicJsonDocument pressureDoc(2048);
+          pressureDoc["e"] = "P";
+          for (uint8_t i = 0; i < 3; i++) {
+            pressureDoc["d"][i] = pressurePacket.data[i];
           }
+
+          serializeJson(pressureDoc, payload);
+        }
+
+      }
+
+      for(uint8_t j = 0; j < 10; j++) {
+        if (xQueueReceive(imuQueue, &(imuPacket), (TickType_t) 0) == pdPASS) {
+          DynamicJsonDocument imuDoc(2048);
+          imuDoc["e"] = "I";
+          for (uint8_t i = 0; i < 9; i++) {
+            imuDoc["d"][i] = pressurePacket.data[i];
+          }
+          serializeJson(imuDoc, payload);
+        }
+      }
+
+      if (payload.length() > 0) {
+        uint8_t buf[payload.length()];
+        memcpy(buf, payload.c_str(), payload.length());
+        SerialBT.write(buf, payload.length());
       }
     }
   }
 }
 
 void pressureTempTask(void * params) {
+  delay(50);
   /* The parameter value is expected to be 1 as 1 is passed in the
   pvParameters value in the call to xTaskCreate() below. */
 
-  uint8_t currentPTBufferSize = pressureSize;
+  uint8_t currentPTBufferSize = PRESSURE_BUFFER_SIZE;
   for ( ;; ) {
     if (SerialBT.hasClient()) {
       while (SerialBT.hasClient()) {
-        icp.measure(ICP101xx::ACCURATE); // ~12 ms delay here.
+        icp.measure(ICP101xx::ACCURATE); // ~12 ms delay here. ACCURATE
 
         float pressure = icp.getPressurePa();
         float temperature = icp.getTemperatureC();
 
-        if (currentPTBufferSize <= 0) {
-          shiftLeft(pressureTempBuffer, pressureSize);
-        } else {
-          currentPTBufferSize--;
-        }
+        String pressureString = String(pressure, 4);
+        String temperatureString = String(temperature, 4);
 
-        // Build Pressure temp packet
-        BluetoothPacket packet = {
-          PT_PACKET,
-          pressure,
-          temperature,
-          0.0
+        PressurePacket pp = PressurePacket {
+          pressure, temperature
         };
 
         // Update the buffer
-        pressureTempBuffer[pressureSize - 1] = packet;
+        shiftLeft(pressureTempBuffer, PRESSURE_BUFFER_SIZE);
+        pressureTempBuffer[PRESSURE_BUFFER_SIZE - 1] = pp;
 
         if (transmitState == TRANSMIT) {
-          xQueueSend(bluetoothQueue,
-                     (void*)&packet,
+          xQueueSend(pressureQueue,
+                     (void*)&pp,
                      ( TickType_t ) 0);
           pCount++;
         }
@@ -188,14 +218,13 @@ void pressureTempTask(void * params) {
 }
 
 void mainTask(void* params) {
+  delay(50);
   /* The parameter value is expected to be 1 as 1 is passed in the
     pvParameters value in the call to xTaskCreate() below. */
 
   for( ;; ) {
     if (SerialBT.hasClient()) {
-      Serial.println("Client is connected!");;
-      Serial.print("Amount of ticks between rest: ");
-      float result;
+      Serial.println("Client is connected!");
 
       sensors_event_t linearXL, gyro, magnetometer;
       double previousAcceleration = -1.0;
@@ -207,7 +236,7 @@ void mainTask(void* params) {
       uint8_t stopCount = STOP_DURATION;
       uint8_t startCount = START_DURATION;
 
-      uint8_t currentXLBufferSize = xlBufferSize;
+      uint8_t currentXLBufferSize = IMU_BUFFER_SIZE;
 
       int xlCountDebug = 0;
 
@@ -228,132 +257,134 @@ void mainTask(void* params) {
 
         totalCount += 1;
 
-        // Read xl and gyr data every 10ms. 100Hz.
-        if (true) {
+        bno.getEvent(&linearXL, Adafruit_BNO055::VECTOR_LINEARACCEL);
+        bno.getEvent(&gyro, Adafruit_BNO055::VECTOR_GYROSCOPE);
+        bno.getEvent(&magnetometer, Adafruit_BNO055::VECTOR_MAGNETOMETER);
 
-          bno.getEvent(&linearXL, Adafruit_BNO055::VECTOR_LINEARACCEL);
-          bno.getEvent(&gyro, Adafruit_BNO055::VECTOR_GYROSCOPE);
-          bno.getEvent(&magnetometer, Adafruit_BNO055::VECTOR_MAGNETOMETER);
+        // Units m/s^2
+        float xl_x = linearXL.acceleration.x;
+        float xl_y = linearXL.acceleration.y;
+        float xl_z = linearXL.acceleration.z;
 
-          // Units m/s^2
-          float xl_x = linearXL.acceleration.x;
-          float xl_y = linearXL.acceleration.y;
-          float xl_z = linearXL.acceleration.z;
+        float magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
 
-          float magnitude = sqrt(xl_x * xl_x + xl_y * xl_y + xl_z * xl_z);
+        float average = shiftAndPop(movingAverageXL, MA_AMOUNT, magnitude);
 
-          float average = shiftAndPop(movingAverageXL, MA_AMOUNT, magnitude);
+        // Serial.print("Transmit State: ");
+        // Serial.print(transmitState);
+        // Serial.print(" The difference: ");
+        // Serial.print(abs(average - previousAverage));
+        // Serial.print(" The stop count: ");
+        // Serial.println(stopCount);
 
-          // Serial.print("Transmit State: ");
-          // Serial.print(transmitState);
-          // Serial.print(" The difference: ");
-          // Serial.print(abs(average - previousAverage));
-          // Serial.print(" The stop count: ");
-          // Serial.println(stopCount);
-
-          if (loadCount < MA_AMOUNT) {
-            movingAverageXL[loadCount] = average;
-            loadCount += 1;
-          } else {
-            if (closedState) {
-              switch (transmitState) {
-                case WAIT_TRANSMIT:
-                  if (previousAverage >= 0 && abs(average - previousAverage) > 0.05) {
-                    startCount -= 1;
-                  } else {
-                    startCount = START_DURATION;
-                  }
-
-                  if (startCount <= 0) {
-                    transmitState = TRANSMIT;
-                    Serial.println("Starting transmission!");
-                    start = millis();
-                    totalCount = 0;
-                    // TODO: Adjust for Bluetooth classic
-                    //                  EventCharacteristic.writeValue(0x01);
-
-                    // TODO: Adjust for Bluetooth classic
-//                  for (uint8_t i = xlBufferSize; i < xlBufferSize; i++) {
-                    //                    LinearAccelerationCharacteristic.writeValue(xlBuffer[i]);
-                    //                    QuaternionCharacteristic.writeValue(quaternionBuffer[i]);
-                    //                    LinearAccelerationCharacteristic.valueUpdated();
-                    //
-                    //                    if (i < pressureSize) {
-                    //                      PressureTempCharacteristic.writeValue(pressureTempBuffer[i]);
-                    //                    }
-//                  }
-                  }
-                  break;
-                case TRANSMIT:
-                  if (abs(average - previousAverage) < 0.1) {
-                    stopCount -= 1;
-                  } else {
-                    stopCount = STOP_DURATION;
-                  }
-
-                  if (stopCount <= 0 || !closedState) {
-                    Serial.println("Stopping transmission!");
-                    transmitState = WAIT_TRANSMIT;
-                    Serial.print("Elapsed time: ");
-                    Serial.println(millis() - start);
-                    Serial.print("Total cycles: ");
-                    Serial.println(totalCount);
-                    stopCount = 0;
-
-                    // TODO: Adjust for Bluetooth classic
-                    //                  EventCharacteristic.writeValue(0x00);
-
-                    Serial.print("XL and Quat Count: ");
-                    Serial.print(xlCountDebug);
-                    Serial.print(" Pressure Count: ");
-                    Serial.println(pCount);
-
-                    xlCountDebug = 0;
-                    pCount = 0;
-                  }
-                  break;
-              }
-            }
-            previousAverage = average;
-          }
-
-          // Build XL Packet
-          uint64_t zero = 0;
-          XLPacket packet = {xl_x, xl_y, xl_z};
-
-          // Build Quaternion packet
-//          float quat_w = quaternion.w();
-//          float quat_x = quaternion.x();
-//          float quat_y = quaternion.y();
-//          float quat_z = quaternion.z();
-//          QuaternionPacket quatPacket = {quat_w, quat_x, quat_y, quat_z};
-
-          if (currentXLBufferSize <= 0) {
-            // Don't pop values until we've filled up the buffer
-//            shiftLeft(quaternionBuffer, xlBufferSize);
-          } else {
-            currentXLBufferSize--;
-          }
-
-//          quaternionBuffer[xlBufferSize - 1] = quatPacket;
-          xlBuffer[xlBufferSize - 1] = packet;
-
-          if (transmitState == TRANSMIT) {
-            // TODO: Adjust for Bluetooth classic
-            //            LinearAccelerationCharacteristic.writeValue(packet);
-            //            QuaternionCharacteristic.writeValue(quatPacket);
-            xlCountDebug++;
-          }
+        if (loadCount < MA_AMOUNT) {
+          // Load up the buffers for the moving average
+          movingAverageXL[loadCount] = average;
+          loadCount += 1;
         } else {
-          xlCount++;
+          if (closedState) {
+            switch (transmitState) {
+              case WAIT_TRANSMIT:
+                if (previousAverage >= 0 && abs(average - previousAverage) > 0.05) {
+                  startCount -= 1;
+                } else {
+                  startCount = START_DURATION;
+                }
+
+                if (startCount <= 0) {
+                  transmitState = TRANSMIT;
+                  Serial.println("Starting transmission!");
+                  start = millis();
+                  totalCount = 0;
+
+                  EventPacket startPacket = EventPacket {
+                    0x01
+                  };
+
+                  xQueueSend(eventQueue,
+                             (void*)&startPacket,
+                             ( TickType_t ) 0);
+
+                  for (uint8_t i = 0; i < PRESSURE_BUFFER_SIZE; i++) {
+                    xQueueSend(pressureQueue,
+                               (void*)&pressureTempBuffer[i],
+                               ( TickType_t ) 0);
+                  }
+                  for (uint8_t i = 0; i < IMU_BUFFER_SIZE; i++) {
+                    xQueueSend(imuQueue,
+                               (void*)&imuBuffer[i],
+                               ( TickType_t ) 0);
+                  }
+                }
+                break;
+              case TRANSMIT:
+                if (abs(average - previousAverage) < 0.1) {
+                  stopCount -= 1;
+                } else {
+                  stopCount = STOP_DURATION;
+                }
+
+                if (stopCount <= 0 || !closedState) {
+                  Serial.println("Stopping transmission!");
+                  transmitState = WAIT_TRANSMIT;
+
+                  EventPacket stopPacket = EventPacket {
+                    0x02
+                  };
+                  xQueueSend(eventQueue, (void*)&stopPacket, (TickType_t) 0);
+
+                  stopCount = 0;
+
+                  start = 0;
+                  Serial.print("Elapsed time: ");
+                  Serial.println(millis() - start);
+                  Serial.print("XL and Quat Count: ");
+                  Serial.print(xlCountDebug);
+                  Serial.print(" Pressure Count: ");
+                  Serial.println(pCount);
+
+                  xlCountDebug = 0;
+                  pCount = 0;
+                }
+                break;
+            }
+          }
+          previousAverage = average;
+        }
+
+        // Build XL Packet
+        uint64_t zero = 0;
+
+        IMUPacket imuPacket = IMUPacket {
+          linearXL.acceleration.x,
+          linearXL.acceleration.y,
+          linearXL.acceleration.z,
+          gyro.acceleration.x,
+          gyro.acceleration.y,
+          gyro.acceleration.z,
+          gyro.magnetic.x,
+          gyro.magnetic.y,
+          gyro.magnetic.z,
+        };
+
+        shiftLeft(imuBuffer, IMU_BUFFER_SIZE);
+        imuBuffer[IMU_BUFFER_SIZE - 1] = imuPacket;
+
+        if (transmitState == TRANSMIT) {
+          xQueueSend(imuQueue,
+                     (void*)&imuPacket,
+                     ( TickType_t ) 0);
+          xlCountDebug++;
         }
       }
     }
+
     vTaskDelay(250 / portTICK_PERIOD_MS);
   }
 }
 
 void clampCheckLoop(void* params) {
+  delay(50);
   TickType_t xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
@@ -364,11 +395,6 @@ void clampCheckLoop(void* params) {
   }
 }
 
-TaskHandle_t xHandle = NULL;
-TaskHandle_t ptHandle = NULL;
-TaskHandle_t clampHandle = NULL;
-TaskHandle_t bluetoothHandle = NULL;
-
 /**
  * STARTUP LOGIC
  */
@@ -376,8 +402,12 @@ void setup() {
   Serial.begin(115200);
 
   vTaskStartScheduler();
-  bluetoothQueue = xQueueCreate(600, sizeof(BluetoothPacket));
 
+  pressureQueue = xQueueCreate(600, sizeof(PressurePacket));
+  imuQueue = xQueueCreate(600, sizeof(IMUPacket));
+  eventQueue = xQueueCreate(10, sizeof(EventPacket));
+
+  delay(500);
 
   Serial.println("Collar warming up...");
 
@@ -421,7 +451,7 @@ void setup() {
   xTaskCreate(
     bluetoothTransmitTask,
     "BLUETOOTH_TASK",
-    2000,
+    1024 * 2 * 2,
     ( void* ) 1,
     tskIDLE_PRIORITY,
     &bluetoothHandle
@@ -429,7 +459,6 @@ void setup() {
 
   Serial.println("Finished collar startup!");
 }
-
 
 // Main loop is empty. Logic should be running in tasks.
 void loop() {}
