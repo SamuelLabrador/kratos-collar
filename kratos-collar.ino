@@ -77,7 +77,7 @@ TaskHandle_t bluetoothHandle = NULL;
 /**
  * HELPER FUNCTIONS
  */
-double shiftAndPop(float *window, uint8_t window_size, double element) {
+double shiftAndPop(float *window, uint16_t window_size, double element) {
   float average = 0;
   for (uint8_t i = 0; i < window_size - 1; i++) {
     window[i] = window[i + 1];
@@ -233,8 +233,8 @@ void mainTask(void* params) {
       float movingAverageXL[MA_AMOUNT] = {};
       float previousAverage = -1.0;
       bool icpMeasuring = false;
-      uint8_t stopCount = STOP_DURATION;
-      uint8_t startCount = START_DURATION;
+      uint16_t stopCount = STOP_DURATION;
+      uint16_t startCount = START_DURATION;
 
       uint8_t currentXLBufferSize = IMU_BUFFER_SIZE;
 
@@ -305,12 +305,12 @@ void mainTask(void* params) {
                              (void*)&startPacket,
                              ( TickType_t ) 0);
 
-                  for (uint8_t i = 0; i < PRESSURE_BUFFER_SIZE; i++) {
+                  for (uint16_t i = 0; i < PRESSURE_BUFFER_SIZE; i++) {
                     xQueueSend(pressureQueue,
                                (void*)&pressureTempBuffer[i],
                                ( TickType_t ) 0);
                   }
-                  for (uint8_t i = 0; i < IMU_BUFFER_SIZE; i++) {
+                  for (uint16_t i = 0; i < IMU_BUFFER_SIZE; i++) {
                     xQueueSend(imuQueue,
                                (void*)&imuBuffer[i],
                                ( TickType_t ) 0);
