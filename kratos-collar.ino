@@ -37,7 +37,7 @@ enum XL_TRANSMIT_STATE {
 };
 
 struct PressurePacket {
-  float data[3];
+  float data[2];
 };
 
 struct IMUPacket {
@@ -53,7 +53,7 @@ struct EventPacket {
  */
 bool closedState = false;
 XL_TRANSMIT_STATE transmitState = WAIT_TRANSMIT;
-const uint16_t STOP_DURATION = 600;
+const uint16_t STOP_DURATION = 350;
 const uint16_t START_DURATION = 15;
 
 // Bluetooth Buffers
@@ -166,8 +166,10 @@ void bluetoothTransmitTask(void * params) {
           DynamicJsonDocument imuDoc(2048);
           imuDoc["e"] = "I";
           for (uint8_t i = 0; i < 9; i++) {
-            imuDoc["d"][i] = pressurePacket.data[i];
+            imuDoc["d"][i] = imuPacket.data[i];
           }
+//          serializeJson(imuDoc, Serial);
+//          Serial.println("");
           serializeJson(imuDoc, payload);
         }
       }
@@ -190,13 +192,10 @@ void pressureTempTask(void * params) {
   for ( ;; ) {
     if (SerialBT.hasClient()) {
       while (SerialBT.hasClient()) {
-        icp.measure(ICP101xx::ACCURATE); // ~12 ms delay here. ACCURATE
+        icp.measure(ICP101xx::ACCURATE); // ~25 ms delay here.
 
         float pressure = icp.getPressurePa();
         float temperature = icp.getTemperatureC();
-
-        String pressureString = String(pressure, 4);
-        String temperatureString = String(temperature, 4);
 
         PressurePacket pp = PressurePacket {
           pressure, temperature
@@ -250,6 +249,7 @@ void mainTask(void* params) {
       TickType_t xLastWakeTime;
       xLastWakeTime = xTaskGetTickCount();
       const TickType_t xFrequency = 10 / portTICK_PERIOD_MS;
+      int count = 100;
 
       while (SerialBT.hasClient()) {
         vTaskDelayUntil( &xLastWakeTime, xFrequency );
@@ -270,12 +270,12 @@ void mainTask(void* params) {
 
         float average = shiftAndPop(movingAverageXL, MA_AMOUNT, magnitude);
 
-        // Serial.print("Transmit State: ");
-        // Serial.print(transmitState);
-        // Serial.print(" The difference: ");
-        // Serial.print(abs(average - previousAverage));
-        // Serial.print(" The stop count: ");
-        // Serial.println(stopCount);
+//         Serial.print("Transmit State: ");
+//         Serial.print(transmitState);
+//         Serial.print(" The difference: ");
+//         Serial.print(abs(average - previousAverage));
+//         Serial.print(" The stop count: ");
+//         Serial.println(stopCount);
 
         if (loadCount < MA_AMOUNT) {
           // Load up the buffers for the moving average
@@ -292,8 +292,8 @@ void mainTask(void* params) {
                 }
 
                 if (startCount <= 0) {
-                  transmitState = TRANSMIT;
                   Serial.println("Starting transmission!");
+                  transmitState = TRANSMIT;
                   start = millis();
                   totalCount = 0;
 
@@ -335,13 +335,13 @@ void mainTask(void* params) {
 
                   stopCount = 0;
 
-                  start = 0;
-                  Serial.print("Elapsed time: ");
                   Serial.println(millis() - start);
+                  Serial.print("Elapsed time: ");
                   Serial.print("XL and Quat Count: ");
                   Serial.print(xlCountDebug);
                   Serial.print(" Pressure Count: ");
                   Serial.println(pCount);
+                  start = 0;
 
                   xlCountDebug = 0;
                   pCount = 0;
