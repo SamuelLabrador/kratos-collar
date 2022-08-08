@@ -11,6 +11,7 @@ include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Arduino_LSM6DSO
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/ArduinoJson/src")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_DPS310")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_BNO055")
+include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_BMP3XX_Library")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_BusIO")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_Unified_Sensor")
 include_directories("C:/Users/Samuel/Documents/Arduino/libraries/Adafruit_LC709203F")

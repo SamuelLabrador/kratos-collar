@@ -16,8 +16,10 @@
 
 // 3 on RP2040 connect
 
-#define CLAMP_PWR 12
+#define CLAMP_PWR 14
 #define CLAMP_PIN 13
+#define YELLOW_LED 19
+#define RED_LED 15
 
 BluetoothSerial SerialBT;
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
@@ -36,12 +38,9 @@ enum XL_TRANSMIT_STATE {
   TRANSMIT
 };
 
-struct PressurePacket {
-  float data[2];
-};
-
-struct IMUPacket {
-  float data[12];
+struct SensorPacket {
+  // [xl_x, xl_y, xl_z, gyr_x, gyr_y, gyr_z, mag_x, mag_y, mag_z, pressure, temp]
+  float data[11];
 };
 
 struct EventPacket {
@@ -51,28 +50,30 @@ struct EventPacket {
 /**
  * GLOBAL VARIABLES
  */
+const uint16_t SENSOR_FREQUENCY = 66;
 bool closedState = false;
 XL_TRANSMIT_STATE transmitState = WAIT_TRANSMIT;
-const uint16_t STOP_DURATION = 350;
+const uint16_t STOP_DURATION = SENSOR_FREQUENCY * 3;
 const uint16_t START_DURATION = 15;
 
-// Bluetooth Buffers
+// These buffers are used to save the last ~1 second of data.
+// These are transmitted when motion is detected.
 const uint16_t IMU_BUFFER_SIZE = 100;
-const uint16_t PRESSURE_BUFFER_SIZE = 40;
+//const uint16_t PRESSURE_BUFFER_SIZE = 40;
+SensorPacket imuBuffer[IMU_BUFFER_SIZE];
+//PressurePacket pressureTempBuffer[PRESSURE_BUFFER_SIZE];
 
-IMUPacket imuBuffer[IMU_BUFFER_SIZE];
-PressurePacket pressureTempBuffer[PRESSURE_BUFFER_SIZE];
+// DEBUG VARIABLES
 unsigned long pCount = 0;
 
-// FreeRTOS variables
-QueueHandle_t pressureQueue;
-QueueHandle_t imuQueue;
+// Queues are used to queue packets to be transmitted by the bluetooth task.
+QueueHandle_t sensorQueue;
 QueueHandle_t eventQueue;
 
 TaskHandle_t xHandle = NULL;
-TaskHandle_t ptHandle = NULL;
 TaskHandle_t clampHandle = NULL;
 TaskHandle_t bluetoothHandle = NULL;
+TaskHandle_t ledHandle = NULL;
 
 /**
  * HELPER FUNCTIONS
@@ -89,13 +90,7 @@ double shiftAndPop(float *window, uint16_t window_size, double element) {
   return average / (double)window_size;
 }
 
-void shiftLeft(IMUPacket *buffer, uint16_t size) {
-  for (uint8_t i = 0; i < size - 1; i++) {
-    buffer[i] = buffer[i + 1];
-  }
-}
-
-void shiftLeft(PressurePacket *buffer, uint16_t size) {
+void shiftLeft(SensorPacket *buffer, uint16_t size) {
   for (uint8_t i = 0; i < size - 1; i++) {
     buffer[i] = buffer[i + 1];
   }
@@ -106,10 +101,10 @@ void shiftLeft(PressurePacket *buffer, uint16_t size) {
  */
 void configureBarometer() {
    Serial.println("Configuring barometer");
-  if (! icp.begin()) {
+  if (!icp.begin()) {
     while (1) yield();
   }
-   Serial.println("Barometer initialized!");
+  Serial.println("Barometer initialized!");
 }
 
 void configureAccel() {
@@ -132,13 +127,15 @@ void configureBluetooth() {
  * TASK FUNCTIONS
  */
 void bluetoothTransmitTask(void * params) {
-  delay(100);
+  delay(1000);
   for (;;) {
-    PressurePacket pressurePacket;
-    IMUPacket imuPacket;
+    SensorPacket sensorPacket;
     EventPacket eventPacket;
-    if (pressureQueue != NULL && imuQueue != NULL && eventQueue != NULL) {
+
+    if (sensorQueue != NULL && eventQueue != NULL) {
       String payload ="";
+      unsigned int count = 0;
+      const unsigned int limit = 15; // Read AT MOST 15 packets from each queue
 
       if (xQueueReceive(eventQueue, &(eventPacket), (TickType_t) 0) == pdPASS) {
         StaticJsonDocument<256> eventDoc;
@@ -148,29 +145,18 @@ void bluetoothTransmitTask(void * params) {
         serializeJson(eventDoc, payload);
       }
 
-      for(uint8_t j = 0; j < 10; j++) {
-        if (xQueueReceive(pressureQueue, &(pressurePacket), ( TickType_t ) 0) == pdPASS) {
-          DynamicJsonDocument pressureDoc(2048);
-          pressureDoc["e"] = "P";
-          for (uint8_t i = 0; i < 3; i++) {
-            pressureDoc["d"][i] = pressurePacket.data[i];
-          }
-
-          serializeJson(pressureDoc, payload);
+      count = 0;
+      while (xQueueReceive(sensorQueue, &(sensorPacket), (TickType_t) 0) == pdPASS) {
+        DynamicJsonDocument imuDoc(2048);
+        imuDoc["e"] = "I";
+        for (uint8_t i = 0; i < 11; i++) {
+          imuDoc["d"][i] = sensorPacket.data[i];
         }
+        serializeJson(imuDoc, payload);
 
-      }
-
-      for(uint8_t j = 0; j < 10; j++) {
-        if (xQueueReceive(imuQueue, &(imuPacket), (TickType_t) 0) == pdPASS) {
-          DynamicJsonDocument imuDoc(2048);
-          imuDoc["e"] = "I";
-          for (uint8_t i = 0; i < 9; i++) {
-            imuDoc["d"][i] = imuPacket.data[i];
-          }
-//          serializeJson(imuDoc, Serial);
-//          Serial.println("");
-          serializeJson(imuDoc, payload);
+        count++;
+        if (count > limit) {
+          break;
         }
       }
 
@@ -183,44 +169,8 @@ void bluetoothTransmitTask(void * params) {
   }
 }
 
-void pressureTempTask(void * params) {
-  delay(50);
-  /* The parameter value is expected to be 1 as 1 is passed in the
-  pvParameters value in the call to xTaskCreate() below. */
-
-  uint8_t currentPTBufferSize = PRESSURE_BUFFER_SIZE;
-  for ( ;; ) {
-    if (SerialBT.hasClient()) {
-      while (SerialBT.hasClient()) {
-        icp.measure(ICP101xx::ACCURATE); // ~25 ms delay here.
-
-        float pressure = icp.getPressurePa();
-        float temperature = icp.getTemperatureC();
-
-        PressurePacket pp = PressurePacket {
-          pressure, temperature
-        };
-
-        // Update the buffer
-        shiftLeft(pressureTempBuffer, PRESSURE_BUFFER_SIZE);
-        pressureTempBuffer[PRESSURE_BUFFER_SIZE - 1] = pp;
-
-        if (transmitState == TRANSMIT) {
-          xQueueSend(pressureQueue,
-                     (void*)&pp,
-                     ( TickType_t ) 0);
-          pCount++;
-        }
-      }
-    }
-  }
-}
-
 void mainTask(void* params) {
-  delay(50);
-  /* The parameter value is expected to be 1 as 1 is passed in the
-    pvParameters value in the call to xTaskCreate() below. */
-
+  delay(1000);
   for( ;; ) {
     if (SerialBT.hasClient()) {
       Serial.println("Client is connected!");
@@ -246,20 +196,37 @@ void mainTask(void* params) {
       unsigned long start;
       unsigned long cycleStart;
       unsigned long totalCount = 0;
+
+      // Scheduling variables
       TickType_t xLastWakeTime;
+      BaseType_t xWasDelayed;
+      const TickType_t xFrequency = 15 / portTICK_PERIOD_MS;
+
+      icp.measureStart(ICP101xx::NORMAL);
       xLastWakeTime = xTaskGetTickCount();
-      const TickType_t xFrequency = 10 / portTICK_PERIOD_MS;
-      int count = 100;
 
       while (SerialBT.hasClient()) {
-        vTaskDelayUntil( &xLastWakeTime, xFrequency );
-        cycleStart = millis();
+        xWasDelayed = xTaskDelayUntil( &xLastWakeTime, xFrequency );
+
+        if (xWasDelayed == pdFALSE) {
+          Serial.println("THE IMU TASK RAN LATE");
+        }
+
+        if (!icp.dataReady()) {
+          Serial.println("The ICP DATA IS NOT READY!");
+        }
 
         totalCount += 1;
+
+        // Kick off measurements. VERY IMPORTANT. This must go before getting the IMU data
+        float pressure = icp.getPressurePa();
+        float temperature = icp.getTemperatureC();
+        icp.measureStart(ICP101xx::NORMAL);
 
         bno.getEvent(&linearXL, Adafruit_BNO055::VECTOR_LINEARACCEL);
         bno.getEvent(&gyro, Adafruit_BNO055::VECTOR_GYROSCOPE);
         bno.getEvent(&magnetometer, Adafruit_BNO055::VECTOR_MAGNETOMETER);
+
 
         // Units m/s^2
         float xl_x = linearXL.acceleration.x;
@@ -305,13 +272,8 @@ void mainTask(void* params) {
                              (void*)&startPacket,
                              ( TickType_t ) 0);
 
-                  for (uint16_t i = 0; i < PRESSURE_BUFFER_SIZE; i++) {
-                    xQueueSend(pressureQueue,
-                               (void*)&pressureTempBuffer[i],
-                               ( TickType_t ) 0);
-                  }
                   for (uint16_t i = 0; i < IMU_BUFFER_SIZE; i++) {
-                    xQueueSend(imuQueue,
+                    xQueueSend(sensorQueue,
                                (void*)&imuBuffer[i],
                                ( TickType_t ) 0);
                   }
@@ -335,12 +297,11 @@ void mainTask(void* params) {
 
                   stopCount = 0;
 
-                  Serial.println(millis() - start);
+                  unsigned long duration = millis() - start;
                   Serial.print("Elapsed time: ");
-                  Serial.print("XL and Quat Count: ");
-                  Serial.print(xlCountDebug);
-                  Serial.print(" Pressure Count: ");
-                  Serial.println(pCount);
+                  Serial.print(duration);
+                  Serial.print(" Value Count: ");
+                  Serial.println(xlCountDebug);
                   start = 0;
 
                   xlCountDebug = 0;
@@ -348,34 +309,60 @@ void mainTask(void* params) {
                 }
                 break;
             }
+          } else if (!closedState && transmitState == TRANSMIT) {
+            Serial.println("Stopping transmission!");
+            transmitState = WAIT_TRANSMIT;
+
+            EventPacket stopPacket = EventPacket {
+              0x02
+            };
+            xQueueSend(eventQueue, (void*)&stopPacket, (TickType_t) 0);
+
+            stopCount = 0;
+
+            unsigned long duration = millis() - start;
+            Serial.print("Elapsed time: ");
+            Serial.print(duration);
+            Serial.print(" Value Count: ");
+            Serial.println(xlCountDebug);
+            start = 0;
+
+            xlCountDebug = 0;
+            pCount = 0;
           }
           previousAverage = average;
         }
 
         // Build XL Packet
-        uint64_t zero = 0;
-
-        IMUPacket imuPacket = IMUPacket {
-          linearXL.acceleration.x,
-          linearXL.acceleration.y,
-          linearXL.acceleration.z,
+        SensorPacket imuPacket = SensorPacket {
+          xl_x,
+          xl_y,
+          xl_z,
           gyro.acceleration.x,
           gyro.acceleration.y,
           gyro.acceleration.z,
-          gyro.magnetic.x,
-          gyro.magnetic.y,
-          gyro.magnetic.z,
+          magnetometer.magnetic.x,
+          magnetometer.magnetic.y,
+          magnetometer.magnetic.z,
+          pressure,
+          temperature
         };
 
         shiftLeft(imuBuffer, IMU_BUFFER_SIZE);
         imuBuffer[IMU_BUFFER_SIZE - 1] = imuPacket;
 
         if (transmitState == TRANSMIT) {
-          xQueueSend(imuQueue,
+          xQueueSend(sensorQueue,
                      (void*)&imuPacket,
                      ( TickType_t ) 0);
           xlCountDebug++;
         }
+
+//        unsigned duration = millis() - cycleStart;
+//        if (duration > 10) {
+//          Serial.print("WARNING! CYCLE WENT OVER 10ms! Duration: ");
+//          Serial.println(duration);
+//        }
       }
     }
 
@@ -384,14 +371,42 @@ void mainTask(void* params) {
 }
 
 void clampCheckLoop(void* params) {
-  delay(50);
+  delay(1000);
   TickType_t xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
 
   for (;;) {
-    vTaskDelayUntil( &xLastWakeTime, xFrequency );
+    vTaskDelay(xFrequency);
     closedState = digitalRead(CLAMP_PIN);
+  }
+}
+
+void ledTask(void* params) {
+  for (;;) {
+    if (SerialBT.hasClient()) {
+      digitalWrite(YELLOW_LED, true);
+      digitalWrite(RED_LED, transmitState == TRANSMIT);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+
+      digitalWrite(YELLOW_LED, closedState);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+    } else {
+      digitalWrite(YELLOW_LED, false);
+      digitalWrite(RED_LED, false);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+void debugTask(void* params) {
+  for (;;) {
+    if (SerialBT.hasClient()) {
+//      Serial.print("Last measured pressure: ");
+//      Serial.println(pressureTempBuffer[PRESSURE_BUFFER_SIZE - 1].data[0]);
+
+      delay(5000);
+    }
   }
 }
 
@@ -401,13 +416,8 @@ void clampCheckLoop(void* params) {
 void setup() {
   Serial.begin(115200);
 
-  vTaskStartScheduler();
-
-  pressureQueue = xQueueCreate(600, sizeof(PressurePacket));
-  imuQueue = xQueueCreate(600, sizeof(IMUPacket));
-  eventQueue = xQueueCreate(10, sizeof(EventPacket));
-
-  delay(500);
+  sensorQueue = xQueueCreate(1024, sizeof(SensorPacket));
+  eventQueue = xQueueCreate(512, sizeof(EventPacket));
 
   Serial.println("Collar warming up...");
 
@@ -417,45 +427,75 @@ void setup() {
 
   pinMode(CLAMP_PIN, INPUT);
   pinMode(CLAMP_PWR, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  digitalWrite(YELLOW_LED, HIGH);
+  digitalWrite(RED_LED, HIGH);
   digitalWrite(CLAMP_PWR, HIGH);
 
+  transmitState = WAIT_TRANSMIT;
+
+  BaseType_t xReturned;
+
   // Accelerometer task
-  xTaskCreate(
+  xReturned = xTaskCreate(
     mainTask,        /* Function that implements the task. */
     "MAIN_TASK",          /* Text name for the task. */
-    2000,      /* Stack size in words, not bytes. */
+    1024 * 2,      /* Stack size in words, not bytes. */
     ( void * ) 1,    /* Parameter passed into the task. */
-    4,/* Priority at which the task is created. */
+    10,         /* Priority at which the task is created. */
     &xHandle );      /* Used to pass out the created task's handle. */
 
-  // Pressure-Temperature Task
-  xTaskCreate(
-    pressureTempTask,
-    "PRESSURE_TEMP_TASK",
-    2000,
-    ( void* ) 1,
-    4,
-    &ptHandle
-  );
+  if (xReturned != pdPASS) {
+    Serial.println("UNABLE TO CREATE MAIN TASK");
+    while(1);
+  }
 
   // Clamp detection Task
-  xTaskCreate(
+  xReturned = xTaskCreate(
     clampCheckLoop,
     "CLAMP_TASK",
-    2000,
-    ( void* ) 1,
-    4,
+    1024,
+    ( void* ) 2,
+    tskIDLE_PRIORITY,
     &clampHandle
   );
 
-  xTaskCreate(
+  if (xReturned != pdPASS) {
+    Serial.println("UNABLE TO CREATE CLAMP TASK");
+    while(1);
+  }
+
+  // Bluetooth task
+  xReturned = xTaskCreate(
     bluetoothTransmitTask,
     "BLUETOOTH_TASK",
     1024 * 2 * 2,
     ( void* ) 1,
-    tskIDLE_PRIORITY,
+    3,
     &bluetoothHandle
   );
+
+  if (xReturned != pdPASS) {
+    Serial.println("UNABLE TO CREATE BLUETOOTH TASK");
+    while(1);
+  }
+
+  // Debug task
+  xReturned = xTaskCreate(
+    ledTask,
+    "LED_TASK",
+    1024,
+    ( void* ) 1,
+    3,
+    &ledHandle
+  );
+
+  if (xReturned != pdPASS) {
+    Serial.println("UNABLE TO CREATE LED TASK");
+    while(1);
+  }
 
   Serial.println("Finished collar startup!");
 }
